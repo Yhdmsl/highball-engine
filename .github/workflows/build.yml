@@ -46,6 +46,28 @@ jobs:
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           x86_64-w64-mingw32-gcc --version | head -1
           i686-w64-mingw32-gcc --version | head -1
+      - name: inotify for Epic install notifications (DP-06)
+        run: |
+          set -euo pipefail
+          # Soju's documented DP-05/DP-06 fix uses the x86_64 libinotify
+          # from this checksum-pinned Whisky dependency bundle plus its header.
+          # Source: https://github.com/BCD1210/soju/blob/main/docs/DIAGNOSIS.md
+          curl -fsSL --retry 3 -o whisky-libs.tar.gz \
+            https://github.com/frankea/Whisky/releases/download/v3.1.1/Libraries.tar.gz
+          echo '01f3a1b43b98065fe20c529c1023b61dd79a6d2ad93bba6040865f646481ccf3  whisky-libs.tar.gz' | shasum -a 256 -c -
+          mkdir -p third_party/whisky-libs third_party/inotify/sys out/engine/lib
+          tar -xzf whisky-libs.tar.gz -C third_party/whisky-libs
+          libs=third_party/whisky-libs/Libraries/Wine/lib
+          test -f "$libs/libinotify.0.dylib"
+          cp -L "$libs/libinotify.0.dylib" out/engine/lib/libinotify.0.dylib
+          ln -s libinotify.0.dylib out/engine/lib/libinotify.dylib
+          # Soju vendored MIT-licensed header for libinotify-kqueue.
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/BCD1210/soju/main/third_party/libinotify-kqueue/sys/inotify.h \
+            -o third_party/inotify/sys/inotify.h
+          test -s third_party/inotify/sys/inotify.h
+          lipo -info out/engine/lib/libinotify.0.dylib | grep -q x86_64
+          echo 'inotify dependency staged (x86_64)'
       - name: ccache
         uses: actions/cache@v4
         with:
@@ -72,10 +94,17 @@ jobs:
             --without-krb5 --without-netapi --without-oss --without-pulse \
             --without-sane --with-sdl --without-udev --without-usb --without-v4l2 --without-x \
             --disable-tests \
+            INOTIFY_CFLAGS="-I${GITHUB_WORKSPACE}/third_party/inotify" \
+            INOTIFY_LIBS="-L${GITHUB_WORKSPACE}/out/engine/lib -linotify" \
             CC="ccache clang" CXX="ccache clang++" \
             CROSSCC="ccache x86_64-w64-mingw32-gcc" \
             i386_CC="ccache i686-w64-mingw32-gcc" x86_64_CC="ccache x86_64-w64-mingw32-gcc" \
             i386_CFLAGS="-g -O2 -msse2 -mfpmath=sse -mincoming-stack-boundary=2"
+          # Missing detection silently disables ReadDirectoryChangesW support.
+          grep -q '^#define HAVE_SYS_INOTIFY_H 1' include/config.h || {
+            echo 'ERROR: Wine configure did not enable sys/inotify.h' >&2
+            exit 1
+          }
           make -j"$(sysctl -n hw.ncpu)"
           make install-lib
       - name: engine layout
@@ -84,6 +113,18 @@ jobs:
           # Highball's engine layout: engine/{bin,lib,share}, renderers/, frameworks/, tools/, manifest.json
           mkdir -p out/renderers out/frameworks out/tools
           test -x out/engine/bin/wine
+          # Relocate libinotify inside the assembled engine, not into Homebrew.
+          # Check before packaging: otherwise Epic can time out with DP-05/DP-06.
+          inotify_ref=$(otool -L out/engine/bin/wineserver | awk 'NR > 1 && $1 ~ /libinotify/ {print $1; exit}')
+          test -n "$inotify_ref" || { echo 'ERROR: wineserver not linked against libinotify' >&2; exit 1; }
+          install_name_tool -id @rpath/libinotify.0.dylib out/engine/lib/libinotify.0.dylib
+          if [ "$inotify_ref" != '@rpath/libinotify.0.dylib' ]; then
+            install_name_tool -change "$inotify_ref" @rpath/libinotify.0.dylib out/engine/bin/wineserver
+          fi
+          install_name_tool -add_rpath @loader_path/../lib out/engine/bin/wineserver 2>/dev/null || true
+          codesign --force --sign - out/engine/lib/libinotify.0.dylib
+          codesign --force --sign - out/engine/bin/wineserver
+          otool -L out/engine/bin/wineserver | grep -F '@rpath/libinotify.0.dylib'
           out/engine/bin/wine --version || true
           # Wine Mono and Gecko, the versions this tree asks for (dlls/appwiz.cpl/addons.c).
           # Without them the first boot of a bottle stops at a "download Mono?" prompt that
